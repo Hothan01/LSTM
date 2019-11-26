@@ -1,0 +1,140 @@
+
+import torch
+import torch.nn as nn
+import numpy as np
+from torch.nn.utils import clip_grad_norm_
+from data_utils import Dictionary, Corpus
+
+
+# 选择CPU还是GPU
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# 超参数
+embedding_size = 128   #词嵌入的维度
+hidden_size = 1024   # 隐藏层的神经元数，即隐藏层节点的个数
+num_layers = 1   # 循环单元的层数
+num_epochs = 5   #迭代次数
+num_samples = 1000     # 测试语言模型生成句子时的样本数
+batch_size = 20   # 一次处理样本的数量
+seq_length = 30   # 一个样本/序列长度
+learning_rate = 0.002
+dropout = 5   #丢包数
+
+# 加载数据集
+corpus = Corpus()
+ids = corpus.get_data('ptb.train.txt', batch_size)   # 数据处理
+vocab_size = len(corpus.dictionary)
+num_batches = ids.size(1) // seq_length
+
+
+# RNN based language model
+class RNNLM(nn.Module):
+    def __init__(self, vocab_size, embedding_size, hidden_size, num_layers):
+        super(RNNLM, self).__init__()
+        # 词向量嵌入
+        self.embed = nn.Embedding(vocab_size, embedding_size)
+        # LSTM单元
+        self.lstm = nn.LSTM(embedding_size, hidden_size, num_layers, batch_first=True)
+        #输出层的全连接操作
+        self.linear = nn.Linear(hidden_size, vocab_size)
+        
+    def forward(self, x, h):
+        # 词嵌入
+        x = self.embed(x)
+        
+        # LSTM的前向运算
+        out, (h, c) = self.lstm(x, h)
+        
+        # # 每个时间步骤上LSTM单元都会有一个输出，batch_size个样本并行计算(每个样本/序列长度一致)
+        # out (batch_size,sequence_length,hidden_size)
+        # 把LSTM的输出结果变更为(batch_size*sequence_length, hidden_size)的维度
+        out = out.reshape(out.size(0)*out.size(1), out.size(2))
+        
+        # Decode hidden states of all time steps
+        #全连接
+        #(batch_size*sequence_length, hidden_size)->(batch_size*sequence_length, vacab_size)
+        out = self.linear(out)
+        return out, (h, c)
+
+model = RNNLM(vocab_size, embedding_size, hidden_size, num_layers).to(device)
+
+# Loss and optimizer
+criterion = nn.CrossEntropyLoss()   #损失函数
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)   #优化器
+
+# Truncated backpropagation
+#不复制gradient
+def detach(states):
+    return [state.detach() for state in states] 
+
+# Train the model
+for epoch in range(num_epochs):
+    # Set initial hidden and cell states
+    #初始化为0
+    states = (torch.zeros(num_layers, batch_size, hidden_size).to(device),
+              torch.zeros(num_layers, batch_size, hidden_size).to(device))
+    
+    for i in range(0, ids.size(1) - seq_length, seq_length):
+        # Get mini-batch inputs and targets
+        #获取一个mini-batch的输入和输出（标签）
+        inputs = ids[:, i:i+seq_length].to(device)
+        targets = ids[:, (i+1):(i+1)+seq_length].to(device)
+        
+        # Forward pass
+        #前向运算
+        states = detach(states)
+        outputs, states = model(inputs, states)
+        loss = criterion(outputs, targets.reshape(-1))
+        
+        # Backward and optimize
+        #反向传播和优化
+        model.zero_grad()
+        loss.backward()
+        clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
+
+        step = (i+1) // seq_length
+        if step % 100 == 0:
+            print ('Epoch [{}/{}], Step[{}/{}], Loss: {:.4f}, Perplexity: {:5.2f}'
+                   .format(epoch+1, num_epochs, step, num_batches, loss.item(), np.exp(loss.item())))
+
+# Test the model
+#测试
+with torch.no_grad():
+    with open('sample.txt', 'w') as f:
+        # Set intial hidden ane cell states
+        #初始化为0
+        state = (torch.zeros(num_layers, 1, hidden_size).to(device),
+                 torch.zeros(num_layers, 1, hidden_size).to(device))
+
+        # Select one word id randomly
+        #随机选择一个词作为输入
+        prob = torch.ones(vocab_size)
+        input = torch.multinomial(prob, num_samples=1).unsqueeze(1).to(device)
+
+        for i in range(num_samples):
+            # Forward propagate RNN
+            #从输入词开始，基于语言模型前推计算
+            output, state = model(input, state)
+
+            # Sample a word id
+            #做预测
+            prob = output.exp()
+            word_id = torch.multinomial(prob, num_samples=1).item()
+
+            # Fill input with sampled word id for the next time step
+            #填充预估结果，为下一次预估储备输入数据
+            input.fill_(word_id)
+
+            # File write
+            #写出输出结果
+            word = corpus.dictionary.idx2word[word_id]
+            word = '\n' if word == '<eos>' else word + ' '
+            f.write(word)
+
+            if (i+1) % 100 == 0:
+                print('Sampled [{}/{}] words and save to {}'.format(i+1, num_samples, 'sample.txt'))
+
+# Save the model checkpoints
+#存储模型的保存点
+torch.save(model.state_dict(), 'model.ckpt')
