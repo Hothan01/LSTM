@@ -1,0 +1,158 @@
+import torch
+import torch.nn as nn
+import torchtext
+from torchtext.vocab import Vectors
+import numpy as np
+import random
+
+
+embed_size = 100
+hidden_size = 1000
+batch_size = 20
+num_epochs = 5
+learning_rate = 0.002
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# 使用 torchtext 对数据进行处理
+TEXT = torchtext.data.Field(lower=True)
+
+# 创建训练集，验证集，测试集
+# LanguageModelingDataset 这个class 帮助我们处理语言模型数据集
+train, val, test = torchtext.datasets.LanguageModelingDataset.splits(
+    path=".",
+    train='ptb.train.txt',
+    validation='ptb.valid.txt',
+    test='ptb.test.txt',
+    text_field=TEXT)
+
+# 创建vocabulary
+# build_vocab 可以根据我们提供的训练数据集来创建最高频单词的单词表
+# max_size 限定单词总量
+TEXT.build_vocab(train)
+
+# len(TEXT.vocab) 单词表的大小
+
+# BPTTIterator 可以连续地得到连贯的句子  bptt_len：句子的长度
+train_iter, val_iter, test_iter = torchtext.data.BPTTIterator.splits(
+    (train, val, test), batch_size=batch_size, device=device,
+    bptt_len=50, repeat=False, shuffle=True)
+
+# 验证了 bptt_len 相当于  seq_len
+# it = iter(train_iter)
+# batch = next(it)
+# print(batch.text.size())
+
+
+# Recurrent neural network (many-to-one)
+class RNNModel(nn.Module):
+    def __init__(self, vocab_size, embed_size, hidden_size,):
+        super(RNNModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.embed = nn.Embedding(vocab_size, embed_size)
+        self.lstm = nn.LSTM(embed_size, hidden_size)
+        self.linear = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, text, hidden):
+
+        emb = self.embed(text)
+        output, hidden = self.lstm(emb, hidden)
+        # Decode the hidden state of the last time step
+        out_vocab = self.linear(output.view(-1, output.shape[2]))
+        return out_vocab.view(output.size(0), output.size(1), out_vocab.size(-1)), hidden
+
+    def init_hidden(self, bsz, requires_grad = True):
+        weight = next(self.parameters())
+        return (weight.new_zeros((1, bsz, self.hidden_size), requires_grad=True),
+                weight.new_zeros((1, bsz, self.hidden_size), requires_grad=True))
+
+
+model = RNNModel(vocab_size=len(TEXT.vocab),
+                 embed_size=embed_size,
+                 hidden_size=hidden_size).to(device)
+
+print(model)   # 查看模型的样子
+
+vocab_size = len(TEXT.vocab)
+
+# Loss and optimizer
+loss_fn = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.5)   # 降学习率
+
+
+# 去除历史， 只要值
+def repackage_hidden(h):
+    if isinstance(h, torch.Tensor):
+        return h.detach()
+    else:
+        return tuple(repackage_hidden(v) for v in h)
+
+
+def evaluate(model, data):
+    model.eval()
+    total_loss = 0.
+    total_count = 0.
+    it = iter(data)
+    with torch.no_grad():
+        hidden = model.init_hidden(batch_size, requires_grad=False)
+        for i, batch in enumerate(it):
+            data, target = batch.text, batch.target
+            hidden = repackage_hidden(hidden)    #得到全新的hidden
+            output, hidden = model(data, hidden)
+
+            loss = loss_fn(output.view(-1, vocab_size), target.view(-1))
+            total_loss = loss.item() * np.multiply(*data.size())
+            total_count = np.multiply(*data.size())
+
+    loss = total_loss / total_count
+    model.train()
+    return loss
+
+
+GRAD_CLIP = 5.0
+val_losses = []
+
+
+# train
+for epoch in range(num_epochs):
+    model.train()   # 模型分为训练模式和测试模式
+    it = iter(train_iter)
+    hidden = model.init_hidden(batch_size)
+    for i, batch in enumerate(it):   # 帮你循环it
+        data, target = batch.text, batch.target
+        hidden = repackage_hidden(hidden)    # 得到全新的hidden
+        output, hidden = model(data, hidden)   # 一般只有语言模型这样传hidden
+
+        loss = loss_fn(output.view(-1, vocab_size), target.view(-1))
+        optimizer.zero_grad()   # 优化参数
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)   # gradient clipping
+        optimizer.step()
+
+        if i % 100 == 0:
+            print ('epoch', epoch, 'Loss:', loss.item(), 'PPL:', np.exp(loss.item()))
+        if i % 200 == 0:
+            val_loss = evaluate(model, val_iter)   # 筛选
+            if len(val_losses) == 0 or val_loss < min(val_losses):
+                torch.save(model.state_dict(), 'lm.bt')   # 保存模型参数
+                print("best model saved to ln.bt")
+            else:
+                # loss降不下来时，learning rate decay
+                scheduler.step()   # 将学习率
+                print("learning rate decay")
+            val_losses.append(val_loss)
+
+
+best_model = RNNModel(vocab_size= len(TEXT.vocab),
+                 embed_size=embed_size,
+                 hidden_size=hidden_size).to(device)
+best_model.load_state_dict(torch.load("lm.bt"))   # 加载最好模型参数
+
+
+val_los = evaluate(best_model, val_iter)
+print('val_ppl:', np.exp(val_los))
+
+test_los = evaluate(best_model, test_iter)
+print('test_ppl:', np.exp(test_los))
