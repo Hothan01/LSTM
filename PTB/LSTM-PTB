@@ -140,7 +140,7 @@ for epoch in range(num_epochs):
                 print("best model saved to ln.bt")
             else:
                 # loss降不下来时，learning rate decay
-                scheduler.step()   # 将学习率
+                scheduler.step()   # 降学习率
                 print("learning rate decay")
             val_losses.append(val_loss)
 
