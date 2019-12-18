@@ -1,11 +1,8 @@
+# from   https://github.com/VictoriousRaptor/sst-clf-torch/blob/master/dataset.py
+
 import re
-# author: wangjh237@mail2.sysu.edu.cn
-# generate phrase ids for sentences in [train, dev, test]
-# you can get phrase ids of [train, dev, test] by the 3 generated files.
-# and then find corresponding sentences in dictionary.txt
 
 def clean_data(sentence):
-    # From yoonkim: https://github.com/yoonkim/CNN_sentence/blob/master/process_data.py
     sentence = re.sub(r"[^A-Za-z0-9(),!?\'\`]", " ", sentence)
     sentence = re.sub(r"\s{2,}", " ", sentence)
     return sentence.strip().lower()
